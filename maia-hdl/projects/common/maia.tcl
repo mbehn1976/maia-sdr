@@ -68,6 +68,26 @@ ad_mem_hp2_interconnect sys_cpu_clk maia_sdr/m_axi_recorder
 ad_mem_hp2_interconnect sys_cpu_clk axi_ad9361_adc_dma/m_dest_axi
 ad_mem_hp2_interconnect sys_cpu_clk axi_ad9361_dac_dma/m_src_axi
 
+# Raw complex capture and continuous I/Q waterfall DMA masters. The I/Q master
+# runs on the maia_sdr clock (HP0, own reset generator so the 62.5 MHz domain
+# does not take the CPU-clock reset unsynchronized); the raw capture master runs
+# in the s_axi_lite (CPU) clock domain (HP3). The helper only attaches a master
+# when its HP interconnect already exists, so the first call for each port
+# names the PS port itself. Its reset net is derived from the clock net name
+# (clk -> resetn), hence the net name maia_clk.
+set maia_clk_net [get_bd_nets -of_objects [get_bd_pins maia_sdr/clk]]
+set_property NAME maia_clk $maia_clk_net
+ad_ip_instance proc_sys_reset maia_clk_rstgen
+ad_connect maia_clk maia_clk_rstgen/slowest_sync_clk
+ad_connect maia_sdr_clk/locked maia_clk_rstgen/dcm_locked
+connect_bd_net [get_bd_pins sys_ps7/FCLK_RESET0_N] [get_bd_pins maia_clk_rstgen/ext_reset_in]
+create_bd_net maia_resetn
+connect_bd_net -net maia_resetn [get_bd_pins maia_clk_rstgen/peripheral_aresetn]
+ad_mem_hpx_interconnect "HP0" maia_clk sys_ps7/S_AXI_HP0
+ad_mem_hpx_interconnect "HP0" maia_clk maia_sdr/m_axi_spectrometer_iq
+ad_mem_hpx_interconnect "HP3" sys_cpu_clk sys_ps7/S_AXI_HP3
+ad_mem_hpx_interconnect "HP3" sys_cpu_clk maia_sdr/m_axi_spectrometer_raw
+
 # AXI HP1
 create_bd_addr_seg -range 0x20000000 -offset 0x00000000 \
                     [get_bd_addr_spaces maia_sdr/m_axi_spectrometer] \
