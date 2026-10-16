@@ -527,6 +527,7 @@ impl IpCore {
         let summary = self.ddc_config_summary(input_sampling_frequency);
         maia_json::DDCConfig {
             enabled: summary.enabled,
+            routing: None,
             frequency: summary.frequency,
             decimation: summary.decimation,
             input_sampling_frequency: summary.input_sampling_frequency,

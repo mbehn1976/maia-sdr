@@ -268,6 +268,12 @@ pub struct PutDDCDesign {
 pub struct DDCConfig {
     /// Indicates whether the DDC is currently enabled.
     pub enabled: bool,
+    /// Whether the DDC output is routed into the cf-ad9361-lpc capture device
+    /// (set with the `enabled` field of PATCH requests).
+    ///
+    /// `None` when the routing state is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<bool>,
     /// Frequency for the mixer, in Hz.
     pub frequency: f64,
     /// Total decimation of this DDC configuration.
@@ -366,6 +372,13 @@ pub struct PatchDDCConfig {
     /// Frequency for the mixer, in Hz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency: Option<f64>,
+    /// Whether to route the DDC output into the cf-ad9361-lpc capture device.
+    ///
+    /// `Some(true)` enables DDC routing (the iio capture carries the decimated
+    /// narrow channel); `Some(false)` restores full-rate wideband IQ; `None`
+    /// leaves routing unchanged. Maps to axi_ad9361 register 0x790200BC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 /// Configuration of a FIR filter in the DDC.
