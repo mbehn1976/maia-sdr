@@ -50,8 +50,9 @@ import os
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, RisingEdge, with_timeout
-from cocotb_bus.drivers import BitDriver
+from cocotb.triggers import ClockCycles, Lock, RisingEdge, with_timeout
+
+from cocotb_bus.drivers import BusDriver
 
 from axi import AXI4Slave
 from backpressure import RandomReady
@@ -165,20 +166,63 @@ def raw_values(mem):
     return [pwr(idx) for idx in range(FFT_SIZE)]
 
 
+class PlainInitAXI4Slave(AXI4Slave):
+    """AXI4Slave that sets its initial AWREADY, WREADY and BVALID with normal
+    writes. AXI4Slave uses immediate writes, which at time zero leave Icarus
+    Verilog's combinatorial nets that depend on them unevaluated (for example
+    the DMA's awvalid & awready), so the Spectrometer's DMAs never see a write
+    address handshake and no buffer ever completes. This needs
+    COCOTB_RESOLVE_X=ZEROS, as the rest of this file, because the slave reads
+    its own inputs before the writes are applied."""
+    def __init__(self, entity, name, clock, memory, big_endian=False,
+                 backpressure_inserter=None, **kwargs):
+        BusDriver.__init__(self, entity, name, clock, **kwargs)
+        self.clock = clock
+        self.big_endian = big_endian
+        self.backpressure = (backpressure_inserter()
+                             if backpressure_inserter is not None
+                             else None)
+        self._wready_cycles = None
+        self.bus.ARREADY.value = 1
+        self.bus.RVALID.value = 0
+        self.bus.RLAST.value = 0
+        self.bus.AWREADY.value = 1
+        self.bus.WREADY.value = 0
+        if hasattr(self.bus, "BVALID"):
+            self.bus.BVALID.value = 0
+        self._memory = memory
+        self.write_address_busy = Lock()
+        self.read_address_busy = Lock()
+        self.write_data_busy = Lock()
+        self._aw = []
+        cocotb.start_soon(self._aw_data())
+        cocotb.start_soon(self._read_data())
+        cocotb.start_soon(self._write_data())
+
+
 class SpectrometerTB:
-    def __init__(self, dut):
+    def __init__(self, dut, mag_backpressure=None, raw_backpressure=None,
+                 iq_backpressure=None):
+        """The *_backpressure arguments are backpressure inserters (such as
+        RandomReady) for the WREADY of the respective AXI4Slave."""
         self.dut = dut
         self.mag_mem = Memory(DMA_BUFFERS * MAG_BUFFER_BYTES)
         self.raw_mem = Memory(RAW_BYTES)
         self.iq_mem = Memory(IQ_DMA_BUFFERS * IQ_BUFFER_BYTES)
-        self.mag_axi = AXI4Slave(dut, 'DMA', dut.clk, self.mag_mem)
-        self.raw_axi = AXI4Slave(dut, 'RAW', dut.clk, self.raw_mem)
-        self.iq_axi = AXI4Slave(dut, 'IQ', dut.clk, self.iq_mem)
+        self.mag_axi = PlainInitAXI4Slave(
+            dut, 'DMA', dut.clk, self.mag_mem,
+            backpressure_inserter=mag_backpressure)
+        self.raw_axi = PlainInitAXI4Slave(
+            dut, 'RAW', dut.clk, self.raw_mem,
+            backpressure_inserter=raw_backpressure)
+        self.iq_axi = PlainInitAXI4Slave(
+            dut, 'IQ', dut.clk, self.iq_mem,
+            backpressure_inserter=iq_backpressure)
 
     def start_clocks(self):
-        cocotb.start_soon(Clock(self.dut.clk, 12, units='ns').start())
-        cocotb.start_soon(Clock(self.dut.clk2x_clk, 6, units='ns').start())
-        cocotb.start_soon(Clock(self.dut.clk3x_clk, 4, units='ns').start())
+        cocotb.start_soon(Clock(self.dut.clk, 12, unit='ns').start())
+        cocotb.start_soon(Clock(self.dut.clk2x_clk, 6, unit='ns').start())
+        cocotb.start_soon(Clock(self.dut.clk3x_clk, 4, unit='ns').start())
 
     async def reset(self, nint=2, warmup=False):
         """warmup=True flushes the FFT core's internal butterfly-stage
@@ -445,25 +489,19 @@ async def test_spectrometer_wready_backpressure(dut):
     (project-pluto-webservice-test-step3): on hardware, the I/Q DMA
     read-back returns far fewer non-zero words than expected, suspected
     to be a stall-sensitivity in the tap/DMA write capture path that an
-    always-ready simulated AXI slave would never exercise. It overrides
-    AXI4Slave's own fixed WREADY=1 with a directly-driven BitDriver on
-    each AXI port's WREADY pin, the same pattern test_cocotb/dma's own
-    test_dma.py already uses to backpressure DmaBRAMWrite (the exact DMA
-    write submodule the magnitude and I/Q paths both use)."""
-    tb = SpectrometerTB(dut)
-    tb.start_clocks()
-    await tb.reset(nint=2, warmup=True)
-
-    mag_backpressure = BitDriver(dut.DMA_WREADY, dut.clk)
-    raw_backpressure = BitDriver(dut.RAW_WREADY, dut.clk)
-    iq_backpressure = BitDriver(dut.IQ_WREADY, dut.clk)
+    always-ready simulated AXI slave would never exercise. It gives each
+    AXI4Slave a backpressure inserter on its WREADY, the same mechanism
+    test_cocotb/dma's own test_dma.py uses to backpressure DmaBRAMWrite (the
+    exact DMA write submodule the magnitude and I/Q paths both use)."""
     # Magnitude and I/Q DMAs run at about 75% ready. At 50% one DMA of 4096
     # words takes longer than a 2-frame epoch (8192 cycles), the next epoch's
     # DMA starts before it finishes and the two buffers legitimately disagree;
     # that is a property of this nint, not of the design.
-    mag_backpressure.start(RandomReady(8, 2)())
-    raw_backpressure.start(RandomReady(4, 4)())
-    iq_backpressure.start(RandomReady(8, 2)())
+    tb = SpectrometerTB(dut, mag_backpressure=RandomReady(8, 2),
+                        raw_backpressure=RandomReady(4, 4),
+                        iq_backpressure=RandomReady(8, 2))
+    tb.start_clocks()
+    await tb.reset(nint=2, warmup=True)
 
     cocotb.start_soon(tb.drive_dc(DC_AMPLITUDE, 0, 400_000))
 
@@ -556,17 +594,17 @@ async def _check_iq_and_magnitude_exact(dut, seed, n, backpressure=False):
     Note: with nint=1 the I/Q tap never writes (nearly_end needs sum_counter
     == 2), so this test uses nint=2."""
     import numpy as np
-    tb = SpectrometerTB(dut)
+    # With backpressure: random WREADY stalls on both DMA write ports, instead
+    # of the always-ready AXI4Slave.
+    tb = SpectrometerTB(
+        dut,
+        mag_backpressure=RandomReady(8, 2) if backpressure else None,
+        iq_backpressure=RandomReady(8, 2) if backpressure else None)
     tb.start_clocks()
     # See SpectrometerTB.reset's docstring: this check is exact, so it
     # needs the FFT core's buffers flushed first, regardless of what
     # (if anything) ran before this test.
     await tb.reset(nint=2, warmup=True)
-    if backpressure:
-        # Random WREADY stalls on both DMA write ports, instead of the
-        # always-ready AXI4Slave.
-        for wready in (dut.DMA_WREADY, dut.IQ_WREADY):
-            BitDriver(wready, dut.clk).start(RandomReady(8, 2)())
     rng = np.random.default_rng(seed)
     re = rng.integers(-8000, 8000, n)
     im = rng.integers(-8000, 8000, n)
