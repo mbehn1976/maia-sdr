@@ -52,8 +52,11 @@ async def measure(host, name, br, expect=None):
         res['expected_bin'] = expect
         r = raw_spectrum(raw, int(m.argmax()), br)
         res['raw_peak'] = int(r.argmax())
-        res['raw_vs_mag_linear_corr'] = round(float(
-            np.corrcoef(r, m)[0, 1]), 4)
+        # log spectra over the main lobe (the noise floor elsewhere is
+        # uncorrelated between the two captures)
+        k = slice(int(m.argmax()) - 4, int(m.argmax()) + 5)
+        res['raw_vs_mag_log_corr'] = round(float(np.corrcoef(
+            np.log10(r[k] + 1e-9), np.log10(m[k] + 1e-9))[0, 1]), 4)
     return res, m, p
 
 
@@ -65,15 +68,25 @@ async def run(a):
     ok = True
     try:
         hwlib.configure(a.tx, a.rx, fs, bw, a.lo, a.rx_gain)
-        offset = a.offset
+        if a.offset == 'auto':
+            # carrier offset between the boards, from a single tone in the
+            # time domain
+            f0 = hwlib.tone_freq(fs, 2050)
+            hwlib.start_tx(a.tx, hwlib.tone(fs, f0), 6000)
+            offset = hwlib.td_freq(hwlib.td_capture(a.rx), fs) - f0
+            print(f'carrier offset {offset:.0f} Hz (measured)', flush=True)
+        else:
+            offset = float(a.offset)
         for k in (2050, -6000):
             f = hwlib.tone_freq(fs, k)
             hwlib.start_tx(a.tx, hwlib.tone(fs, f), 6000)
             expect = int(round(2048 + (f + offset) / (fs / hwlib.FRAME)))
             r, _, _ = await measure(a.rx, f'cw {f:.0f} Hz', br, expect)
             good = (r['mag_peak'] in (expect - 1, expect, expect + 1)
-                    and r['iq_peak'] == [r['mag_peak']]
-                    and r['raw_vs_mag_linear_corr'] > 0.99)
+                    # a tone near a half-bin position can put the peak of a
+                    # single frame on either neighbouring bin
+                    and all(abs(k - r['mag_peak']) <= 1 for k in r['iq_peak'])
+                    and r['raw_vs_mag_log_corr'] > 0.99)
             ok &= good
             print(json.dumps(r), 'ok' if good else 'FAIL', flush=True)
         hwlib.stop_tx(a.tx)
@@ -111,9 +124,11 @@ def main():
     ap.add_argument('--rx', default='192.168.3.1')
     ap.add_argument('--lo', type=int, default=2_400_000_000)
     ap.add_argument('--rx-gain', type=int, default=40)
-    ap.add_argument('--offset', type=float, default=-49_500.0,
-                    help='carrier offset between the boards in Hz (about '
-                    '-20 ppm of the LO for the two test boards)')
+    ap.add_argument('--offset', default='auto',
+                    help='carrier offset between the boards in Hz, or auto '
+                    '(default): measured from a tone in the time domain. It '
+                    'is about +-20 ppm of the LO for the two test boards and '
+                    'drifts by a kHz or so, so a fixed value goes stale')
     raise SystemExit(asyncio.run(run(ap.parse_args())))
 
 
