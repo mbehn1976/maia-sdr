@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2022-2023 Daniel Estevez <daniel@destevez.net>
+# Copyright (C) 2022-2023,2026 Daniel Estevez <daniel@destevez.net>
 #
 # This file is part of maia-sdr
 #
@@ -20,7 +20,7 @@ from memory import Memory
 
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge
-from cocotb.regression import TestFactory
+
 
 NUM_WRITES = 3  # write 3 buffers per test
 MEMORY_START = 0x0000f000
@@ -29,10 +29,11 @@ MEMORY_BYTES = MEMORY_END - MEMORY_START
 
 
 class DmaStreamWriteTB:
-    def __init__(self, dut):
+    def __init__(self, dut, backpressure_inserter):
         self.memory = Memory(MEMORY_BYTES)
-        self.subordinate = AXI4Slave(dut, None, dut.clk, self.memory)
-        self.backpressure = BitDriver(dut.WREADY, dut.clk)
+        self.subordinate = AXI4Slave(
+            dut, None, dut.clk, self.memory,
+            backpressure_inserter=backpressure_inserter)
 
 
 async def starts(dut):
@@ -62,6 +63,7 @@ async def check_address(dut):
 async def stream_data(dut):
     n = 0
     rising = RisingEdge(dut.clk)
+    dut.stream_valid.value = 0
     while True:
         await rising
         if dut.stream_valid.value and dut.stream_ready.value:
@@ -71,18 +73,19 @@ async def stream_data(dut):
         dut.stream_valid.value = 1
 
 
-async def run_test(dut, backpressure_inserter=None):
-    cocotb.start_soon(Clock(dut.clk, 10, units='ns').start())
+@cocotb.test(timeout_time=100, timeout_unit="us")
+@cocotb.parametrize(
+    backpressure_inserter=[None, RandomReady(), RandomReady(2, 2)],
+)
+async def test_dma_stream(dut, backpressure_inserter=None):
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
     cocotb.start_soon(check_address(dut))
     dut.rst.value = 1
     dut.start.value = 0
     dut.stop.value = 0
     await ClockCycles(dut.clk, 2)
-    tb = DmaStreamWriteTB(dut)
+    tb = DmaStreamWriteTB(dut, backpressure_inserter)
     dut.rst.value = 0
-
-    if backpressure_inserter:
-        tb.backpressure.start(backpressure_inserter())
 
     bytes_written = 0
     bytes_per_word = 8
@@ -109,9 +112,3 @@ async def run_test(dut, backpressure_inserter=None):
 
     assert tb.memory._data == expected, \
         'memory contents do not match'
-
-
-factory = TestFactory(run_test)
-factory.add_option('backpressure_inserter',
-                   [None, RandomReady(), RandomReady(2, 2)])
-factory.generate_tests()

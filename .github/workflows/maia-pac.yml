@@ -13,7 +13,9 @@ defaults:
 
 jobs:
   publish:
+    name: Publish Rust crate
+    runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v4      
     - name: Publish Rust crate
-      runs-on: ubuntu-latest
       run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
