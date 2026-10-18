@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2022-2023 Daniel Estevez <daniel@destevez.net>
+# Copyright (C) 2022-2023,2026 Daniel Estevez <daniel@destevez.net>
 #
 # This file is part of maia-sdr
 #
@@ -19,7 +19,6 @@ from memory import Memory
 
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge
-from cocotb.regression import TestFactory
 
 
 BRAM_SIZE = 4096
@@ -27,10 +26,11 @@ NUM_WRITES = 3  # write 3 transfers per test
 
 
 class DmaBRAMWriteTB:
-    def __init__(self, dut):
+    def __init__(self, dut, backpressure_inserter):
         self.memory = Memory(2 * 1024 * 1024)
-        self.subordinate = AXI4Slave(dut, None, dut.clk, self.memory)
-        self.backpressure = BitDriver(dut.WREADY, dut.clk)
+        self.subordinate = AXI4Slave(
+            dut, None, dut.clk, self.memory,
+            backpressure_inserter=backpressure_inserter)
 
 
 async def starts(dut):
@@ -56,17 +56,18 @@ async def check_address(dut):
         await rising
 
 
-async def run_test(dut, backpressure_inserter=None):
-    cocotb.start_soon(Clock(dut.clk, 10, units='ns').start())
+@cocotb.test(timeout_time=1000, timeout_unit="us")
+@cocotb.parametrize(
+    backpressure_inserter=[None, RandomReady(), RandomReady(2, 2)],
+)
+async def test_dma(dut, backpressure_inserter):
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
     cocotb.start_soon(check_address(dut))
     dut.rst.value = 1
     dut.start.value = 0
     await ClockCycles(dut.clk, 2)
-    tb = DmaBRAMWriteTB(dut)
+    tb = DmaBRAMWriteTB(dut, backpressure_inserter)
     dut.rst.value = 0
-
-    if backpressure_inserter:
-        tb.backpressure.start(backpressure_inserter())
 
     bytes_written = 0
     bytes_per_word = 8
@@ -89,9 +90,3 @@ async def run_test(dut, backpressure_inserter=None):
 
     assert tb.memory._data[:bytes_written] == expected, \
         'memory contents do not match'
-
-
-factory = TestFactory(run_test)
-factory.add_option('backpressure_inserter',
-                   [None, RandomReady(), RandomReady(2, 2)])
-factory.generate_tests()

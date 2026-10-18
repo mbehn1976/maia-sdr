@@ -1,4 +1,4 @@
-# Copyright (c) 2022 Daniel Estevez <daniel@destevez.net>
+# Copyright (c) 2022,2026 Daniel Estevez <daniel@destevez.net>
 # Copyright cocotb contributors
 # Copyright (c) 2014 Potential Ventures Ltd
 # Licensed under the Revised BSD License, see LICENSE for details.
@@ -13,9 +13,9 @@ import itertools
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import cocotb
-from cocotb.binary import BinaryValue
-from cocotb.handle import SimHandleBase
+from cocotb.handle import Immediate, SimHandleBase
 from cocotb.triggers import ClockCycles, Combine, Lock, ReadOnly, RisingEdge
+from cocotb.types import LogicArray
 
 from cocotb_bus.drivers import BusDriver
 
@@ -49,23 +49,28 @@ class AXI4Slave(BusDriver):
     ]
 
     def __init__(self, entity, name, clock, memory, callback=None, event=None,
-                 big_endian=False, **kwargs):
+                 big_endian=False, backpressure_inserter=None, **kwargs):
 
         BusDriver.__init__(self, entity, name, clock, **kwargs)
         self.clock = clock
 
         self.big_endian = big_endian
-        self.bus.ARREADY.setimmediatevalue(1)
-        self.bus.RVALID.setimmediatevalue(0)
-        self.bus.RLAST.setimmediatevalue(0)
-        self.bus.AWREADY.setimmediatevalue(1)
+        self.backpressure = (backpressure_inserter()
+                             if backpressure_inserter is not None
+                             else None)
+        self._wready_cycles = None
+        self.bus.ARREADY.set(Immediate(1))
+        self.bus.RVALID.set(Immediate(0))
+        self.bus.RLAST.set(Immediate(0))
+        self.bus.AWREADY.set(Immediate(1))
+        self.bus.WREADY.set(Immediate(0))
         if hasattr(self.bus, "BVALID"):
-            self.bus.BVALID.setimmediatevalue(0)
+            self.bus.BVALID.set(Immediate(0))
         self._memory = memory
 
-        self.write_address_busy = Lock("%s_wabusy" % name)
-        self.read_address_busy = Lock("%s_rabusy" % name)
-        self.write_data_busy = Lock("%s_wbusy" % name)
+        self.write_address_busy = Lock()
+        self.read_address_busy = Lock()
+        self.write_data_busy = Lock()
 
         self._aw = []
         cocotb.start_soon(self._aw_data())
@@ -87,11 +92,11 @@ class AXI4Slave(BusDriver):
             else:
                 self.bus.AWREADY.value = 0
             if self.bus.AWREADY.value and self.bus.AWVALID.value:
-                _awaddr = int(self.bus.AWADDR)
-                _awlen = int(self.bus.AWLEN)
-                _awsize = int(self.bus.AWSIZE)
-                _awburst = int(self.bus.AWBURST)
-                _awprot = int(self.bus.AWPROT)
+                _awaddr = self.bus.AWADDR.value.to_unsigned()
+                _awlen = self.bus.AWLEN.value.to_unsigned()
+                _awsize = self.bus.AWSIZE.value.to_unsigned()
+                _awburst = self.bus.AWBURST.value.to_unsigned()
+                _awprot = self.bus.AWPROT.value.to_unsigned()
                 burst_length = _awlen + 1
                 bytes_in_beat = self._size_to_bytes_in_beat(_awsize)
 
@@ -116,6 +121,20 @@ class AXI4Slave(BusDriver):
                         "Bytes in beat %d\n" % bytes_in_beat)
             await clock_re
 
+    def _update_wready(self):
+        if self.backpressure is None:
+            self.bus.WREADY.value = 1
+            return
+        if self._wready_cycles is None or (self._wready_cycles[0] == 0
+                                           and self._wready_cycles[1] == 0):
+            self._wready_cycles = list(next(self.backpressure))
+        if self._wready_cycles[0] > 0:
+            self.bus.WREADY.value = 1
+            self._wready_cycles[0] -= 1
+        else:
+            self.bus.WREADY.value = 0
+            self._wready_cycles[1] -= 1
+
     async def _write_data(self):
         clock_re = RisingEdge(self.clock)
 
@@ -123,7 +142,7 @@ class AXI4Slave(BusDriver):
             while True:
                 self.bus.WREADY.value = 0
                 if self._aw:
-                    self.bus.WREADY.value = 1
+                    self._update_wready()
                     break
                 await clock_re
 
@@ -134,17 +153,18 @@ class AXI4Slave(BusDriver):
 
             while True:
                 if self.bus.WREADY.value and self.bus.WVALID.value:
-                    word = self.bus.WDATA.value
-                    word.big_endian = self.big_endian
                     _burst_diff = aw['burst_length'] - burst_count
                     _st = (aw['_awaddr']
                            + (_burst_diff * aw['bytes_in_beat']))  # start
                     _end = (aw['_awaddr']
                             + ((_burst_diff + 1) * aw['bytes_in_beat']))  # end
-                    self._memory[_st:_end] = array.array('B', word.buff)
+                    self._memory[_st:_end] = array.array(
+                        'B', self.bus.WDATA.value.to_bytes(
+                            byteorder='big' if self.big_endian else 'little'))
                     burst_count -= 1
                     if burst_count == 0:
                         break
+                self._update_wready()
                 await clock_re
 
             if hasattr(self.bus, "BREADY") and hasattr(self.bus, "BVALID"):
@@ -170,17 +190,14 @@ class AXI4Slave(BusDriver):
                 await clock_re
 
             await ReadOnly()
-            _araddr = int(self.bus.ARADDR)
-            _arlen = int(self.bus.ARLEN)
-            _arsize = int(self.bus.ARSIZE)
-            _arburst = int(self.bus.ARBURST)
-            _arprot = int(self.bus.ARPROT)
+            _araddr = self.bus.ARADDR.value.to_unsigned()
+            _arlen = self.bus.ARLEN.value.to_unsigned()
+            _arsize = self.bus.ARSIZE.value.to_unsigned()
+            _arburst = self.bus.ARBURST.value.to_unsigned()
+            _arprot = self.bus.ARPROT.value.to_unsigned()
 
             burst_length = _arlen + 1
             bytes_in_beat = self._size_to_bytes_in_beat(_arsize)
-
-            word = BinaryValue(n_bits=bytes_in_beat*8,
-                               bigEndian=self.big_endian)
 
             if __debug__:
                 self.log.debug(
@@ -203,8 +220,9 @@ class AXI4Slave(BusDriver):
                     _burst_diff = burst_length - burst_count
                     _st = _araddr + (_burst_diff * bytes_in_beat)
                     _end = _araddr + ((_burst_diff + 1) * bytes_in_beat)
-                    word.buff = self._memory[_st:_end].tobytes()
-                    self.bus.RDATA.value = word
+                    self.bus.RDATA.value = LogicArray.from_bytes(
+                        self._memory[_st:_end].tobytes(),
+                        byteorder='big' if self.big_endian else 'little')
                     if burst_count == 1:
                         self.bus.RLAST.value = 1
                 await clock_re
